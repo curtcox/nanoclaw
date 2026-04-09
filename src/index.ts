@@ -27,6 +27,7 @@ import {
 } from './container-runner.js';
 import {
   cleanupOrphans,
+  DIRECT_MODE,
   ensureContainerRuntimeRunning,
 } from './container-runtime.js';
 import {
@@ -573,6 +574,19 @@ async function main(): Promise<void> {
   initDatabase();
   logger.info('Database initialized');
   loadState();
+
+  // In direct mode with CLI channel, auto-register the CLI as the main group
+  if (DIRECT_MODE && !registeredGroups['cli:main']) {
+    registerGroup('cli:main', {
+      name: 'CLI Main',
+      folder: 'main',
+      trigger: DEFAULT_TRIGGER,
+      added_at: new Date().toISOString(),
+      requiresTrigger: false,
+      isMain: true,
+    });
+    logger.info('Auto-registered CLI main group for direct mode');
+  }
 
   // Ensure OneCLI agents exist for all registered groups.
   // Recovers from missed creates (e.g. OneCLI was down at registration time).

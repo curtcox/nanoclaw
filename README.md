@@ -72,6 +72,7 @@ Then run `/setup`. Claude Code handles everything: dependencies, authentication,
 - **Scheduled tasks** - Recurring jobs that run Claude and can message you back
 - **Web access** - Search and fetch content from the Web
 - **Container isolation** - Agents are sandboxed in Docker (macOS/Linux), [Docker Sandboxes](docs/docker-sandboxes.md) (micro VM isolation), or Apple Container (macOS)
+- **Direct mode** - Run without Docker entirely using [direct mode](docs/direct-mode.md), where agents execute as host child processes via the Claude CLI
 - **Credential security** - Agents never hold raw API keys. Outbound requests route through [OneCLI's Agent Vault](https://github.com/onecli/onecli), which injects credentials at request time and enforces per-agent policies and rate limits.
 - **Agent Swarms** - Spin up teams of specialized agents that collaborate on complex tasks
 - **Optional integrations** - Add Gmail (`/add-gmail`) and more via skills
@@ -128,6 +129,18 @@ Skills we'd like to see:
 - [Claude Code](https://claude.ai/download)
 - [Apple Container](https://github.com/apple/container) (macOS) or [Docker](https://docker.com/products/docker-desktop) (macOS/Linux)
 
+### Running Without Docker (Direct Mode)
+
+If you don't have or don't want Docker, NanoClaw can run agents as host child processes instead of in containers:
+
+```bash
+npm install
+cd container/agent-runner && npm install && cd ../..
+NANOCLAW_DIRECT_MODE=1 npx tsx src/index.ts
+```
+
+This gives you full functionality (all channels, scheduled tasks, session continuity) without any container runtime. See [docs/direct-mode.md](docs/direct-mode.md) for details.
+
 ## Architecture
 
 ```
@@ -153,7 +166,7 @@ Key files:
 
 **Why Docker?**
 
-Docker provides cross-platform support (macOS, Linux and even Windows via WSL2) and a mature ecosystem. On macOS, you can optionally switch to Apple Container via `/convert-to-apple-container` for a lighter-weight native runtime. For additional isolation, [Docker Sandboxes](docs/docker-sandboxes.md) run each container inside a micro VM.
+Docker provides cross-platform support (macOS, Linux and even Windows via WSL2) and a mature ecosystem. On macOS, you can optionally switch to Apple Container via `/convert-to-apple-container` for a lighter-weight native runtime. For additional isolation, [Docker Sandboxes](docs/docker-sandboxes.md) run each container inside a micro VM. If you don't need container isolation, you can skip Docker entirely with [direct mode](docs/direct-mode.md).
 
 **Can I run this on Linux or Windows?**
 

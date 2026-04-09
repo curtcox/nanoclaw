@@ -7,11 +7,15 @@ import os from 'os';
 
 import { logger } from './logger.js';
 
+/** Whether to run agents directly without Docker containers. */
+export const DIRECT_MODE = process.env.NANOCLAW_DIRECT_MODE === '1';
+
 /** The container runtime binary name. */
 export const CONTAINER_RUNTIME_BIN = 'docker';
 
 /** CLI args needed for the container to resolve the host gateway. */
 export function hostGatewayArgs(): string[] {
+  if (DIRECT_MODE) return [];
   // On Linux, host.docker.internal isn't built-in — add it explicitly
   if (os.platform() === 'linux') {
     return ['--add-host=host.docker.internal:host-gateway'];
@@ -29,6 +33,7 @@ export function readonlyMountArgs(
 
 /** Stop a container by name. Uses execFileSync to avoid shell injection. */
 export function stopContainer(name: string): void {
+  if (DIRECT_MODE) return;
   if (!/^[a-zA-Z0-9][a-zA-Z0-9_.-]*$/.test(name)) {
     throw new Error(`Invalid container name: ${name}`);
   }
@@ -37,6 +42,10 @@ export function stopContainer(name: string): void {
 
 /** Ensure the container runtime is running, starting it if needed. */
 export function ensureContainerRuntimeRunning(): void {
+  if (DIRECT_MODE) {
+    logger.info('Direct mode enabled — skipping container runtime check');
+    return;
+  }
   try {
     execSync(`${CONTAINER_RUNTIME_BIN} info`, {
       stdio: 'pipe',
@@ -77,6 +86,7 @@ export function ensureContainerRuntimeRunning(): void {
 
 /** Kill orphaned NanoClaw containers from previous runs. */
 export function cleanupOrphans(): void {
+  if (DIRECT_MODE) return;
   try {
     const output = execSync(
       `${CONTAINER_RUNTIME_BIN} ps --filter name=nanoclaw- --format '{{.Names}}'`,

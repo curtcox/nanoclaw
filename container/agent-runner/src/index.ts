@@ -60,7 +60,9 @@ interface SDKUserMessage {
   session_id: string;
 }
 
-const IPC_INPUT_DIR = '/workspace/ipc/input';
+const IPC_INPUT_DIR = process.env.NANOCLAW_DIRECT_MODE === '1'
+  ? path.join(process.env.NANOCLAW_IPC_DIR || '/workspace/ipc', 'input')
+  : '/workspace/ipc/input';
 const IPC_INPUT_CLOSE_SENTINEL = path.join(IPC_INPUT_DIR, '_close');
 const IPC_POLL_MS = 500;
 
@@ -182,7 +184,10 @@ function createPreCompactHook(assistantName?: string): HookCallback {
       const summary = getSessionSummary(sessionId, transcriptPath);
       const name = summary ? sanitizeFilename(summary) : generateFallbackName();
 
-      const conversationsDir = '/workspace/group/conversations';
+      const groupDir = process.env.NANOCLAW_DIRECT_MODE === '1'
+        ? (process.env.NANOCLAW_GROUP_DIR || '/workspace/group')
+        : '/workspace/group';
+      const conversationsDir = path.join(groupDir, 'conversations');
       fs.mkdirSync(conversationsDir, { recursive: true });
 
       const date = new Date().toISOString().split('T')[0];
@@ -413,7 +418,10 @@ async function runQuery(
   let resultCount = 0;
 
   // Load global CLAUDE.md as additional system context (shared across all groups)
-  const globalClaudeMdPath = '/workspace/global/CLAUDE.md';
+  const isDirect = process.env.NANOCLAW_DIRECT_MODE === '1';
+  const globalClaudeMdPath = isDirect
+    ? path.join(process.env.NANOCLAW_GLOBAL_DIR || '/workspace/global', 'CLAUDE.md')
+    : '/workspace/global/CLAUDE.md';
   let globalClaudeMd: string | undefined;
   if (!containerInput.isMain && fs.existsSync(globalClaudeMdPath)) {
     globalClaudeMd = fs.readFileSync(globalClaudeMdPath, 'utf-8');
@@ -435,10 +443,14 @@ async function runQuery(
     log(`Additional directories: ${extraDirs.join(', ')}`);
   }
 
+  const workingDir = isDirect
+    ? (process.env.NANOCLAW_GROUP_DIR || '/workspace/group')
+    : '/workspace/group';
+
   for await (const message of query({
     prompt: stream,
     options: {
-      cwd: '/workspace/group',
+      cwd: workingDir,
       additionalDirectories: extraDirs.length > 0 ? extraDirs : undefined,
       resume: sessionId,
       resumeSessionAt: resumeAt,
@@ -476,12 +488,16 @@ async function runQuery(
       settingSources: ['project', 'user'],
       mcpServers: {
         nanoclaw: {
-          command: 'node',
-          args: [mcpServerPath],
+          command: isDirect ? 'npx' : 'node',
+          args: isDirect ? ['tsx', mcpServerPath] : [mcpServerPath],
           env: {
             NANOCLAW_CHAT_JID: containerInput.chatJid,
             NANOCLAW_GROUP_FOLDER: containerInput.groupFolder,
             NANOCLAW_IS_MAIN: containerInput.isMain ? '1' : '0',
+            ...(isDirect ? {
+              NANOCLAW_DIRECT_MODE: '1',
+              NANOCLAW_IPC_DIR: process.env.NANOCLAW_IPC_DIR || '/workspace/ipc',
+            } : {}),
           },
         },
       },
@@ -629,7 +645,8 @@ async function main(): Promise<void> {
   };
 
   const __dirname = path.dirname(fileURLToPath(import.meta.url));
-  const mcpServerPath = path.join(__dirname, 'ipc-mcp-stdio.js');
+  const mcpServerExt = process.env.NANOCLAW_DIRECT_MODE === '1' ? 'ipc-mcp-stdio.ts' : 'ipc-mcp-stdio.js';
+  const mcpServerPath = path.join(__dirname, mcpServerExt);
 
   let sessionId = containerInput.sessionId;
   fs.mkdirSync(IPC_INPUT_DIR, { recursive: true });

@@ -20,6 +20,7 @@ import { resolveGroupFolderPath, resolveGroupIpcPath } from './group-folder.js';
 import { logger } from './logger.js';
 import {
   CONTAINER_RUNTIME_BIN,
+  DIRECT_MODE,
   hostGatewayArgs,
   readonlyMountArgs,
   stopContainer,
@@ -293,12 +294,267 @@ async function buildContainerArgs(
   return args;
 }
 
+/**
+ * Run agent directly as a host child process (no Docker).
+ * Uses index-direct.ts which calls the `claude` CLI.
+ */
+async function runDirectAgent(
+  group: RegisteredGroup,
+  input: ContainerInput,
+  onProcess: (proc: ChildProcess, containerName: string) => void,
+  onOutput?: (output: ContainerOutput) => Promise<void>,
+): Promise<ContainerOutput> {
+  const startTime = Date.now();
+  const projectRoot = process.cwd();
+
+  const groupDir = resolveGroupFolderPath(group.folder);
+  fs.mkdirSync(groupDir, { recursive: true });
+
+  const groupIpcDir = resolveGroupIpcPath(group.folder);
+  fs.mkdirSync(path.join(groupIpcDir, 'messages'), { recursive: true });
+  fs.mkdirSync(path.join(groupIpcDir, 'tasks'), { recursive: true });
+  fs.mkdirSync(path.join(groupIpcDir, 'input'), { recursive: true });
+
+  const globalDir = path.join(GROUPS_DIR, 'global');
+  const groupSessionsDir = path.join(
+    DATA_DIR,
+    'sessions',
+    group.folder,
+    '.claude',
+  );
+  fs.mkdirSync(groupSessionsDir, { recursive: true });
+
+  // Sync skills into group sessions dir
+  const skillsSrc = path.join(projectRoot, 'container', 'skills');
+  const skillsDst = path.join(groupSessionsDir, 'skills');
+  if (fs.existsSync(skillsSrc)) {
+    for (const skillDir of fs.readdirSync(skillsSrc)) {
+      const srcDir = path.join(skillsSrc, skillDir);
+      if (!fs.statSync(srcDir).isDirectory()) continue;
+      const dstDir = path.join(skillsDst, skillDir);
+      fs.cpSync(srcDir, dstDir, { recursive: true });
+    }
+  }
+
+  // Settings file for Claude Code
+  const settingsFile = path.join(groupSessionsDir, 'settings.json');
+  if (!fs.existsSync(settingsFile)) {
+    fs.writeFileSync(
+      settingsFile,
+      JSON.stringify(
+        {
+          env: {
+            CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS: '1',
+            CLAUDE_CODE_ADDITIONAL_DIRECTORIES_CLAUDE_MD: '1',
+            CLAUDE_CODE_DISABLE_AUTO_MEMORY: '0',
+          },
+        },
+        null,
+        2,
+      ) + '\n',
+    );
+  }
+
+  const agentRunnerDir = path.join(projectRoot, 'container', 'agent-runner');
+  const agentRunnerNodeModules = path.join(agentRunnerDir, 'node_modules');
+  const entryPoint = path.join(agentRunnerDir, 'src', 'index-direct.ts');
+
+  const childEnv: Record<string, string> = {
+    ...process.env as Record<string, string>,
+    TZ: TIMEZONE,
+    NANOCLAW_DIRECT_MODE: '1',
+    NANOCLAW_GROUP_DIR: groupDir,
+    NANOCLAW_IPC_DIR: groupIpcDir,
+    NANOCLAW_GLOBAL_DIR: globalDir,
+    NANOCLAW_PROJECT_DIR: projectRoot,
+    NANOCLAW_SESSIONS_DIR: groupSessionsDir,
+    NODE_PATH: agentRunnerNodeModules,
+  };
+
+  logger.info(
+    {
+      group: group.name,
+      entryPoint,
+      groupDir,
+      ipcDir: groupIpcDir,
+      isMain: input.isMain,
+    },
+    'Spawning direct agent',
+  );
+
+  const logsDir = path.join(groupDir, 'logs');
+  fs.mkdirSync(logsDir, { recursive: true });
+
+  return new Promise((resolve) => {
+    const proc = spawn('npx', ['tsx', entryPoint], {
+      stdio: ['pipe', 'pipe', 'pipe'],
+      env: childEnv,
+      cwd: groupDir,
+    });
+
+    const containerName = `direct-${group.folder}-${Date.now()}`;
+    onProcess(proc, containerName);
+
+    let stdout = '';
+    let stderr = '';
+    let parseBuffer = '';
+    let newSessionId: string | undefined;
+    let outputChain = Promise.resolve();
+    let hadStreamingOutput = false;
+
+    proc.stdin.write(JSON.stringify(input));
+    proc.stdin.end();
+
+    proc.stdout.on('data', (data) => {
+      const chunk = data.toString();
+      stdout += chunk;
+
+      if (onOutput) {
+        parseBuffer += chunk;
+        let startIdx: number;
+        while ((startIdx = parseBuffer.indexOf(OUTPUT_START_MARKER)) !== -1) {
+          const endIdx = parseBuffer.indexOf(OUTPUT_END_MARKER, startIdx);
+          if (endIdx === -1) break;
+
+          const jsonStr = parseBuffer
+            .slice(startIdx + OUTPUT_START_MARKER.length, endIdx)
+            .trim();
+          parseBuffer = parseBuffer.slice(endIdx + OUTPUT_END_MARKER.length);
+
+          try {
+            const parsed: ContainerOutput = JSON.parse(jsonStr);
+            if (parsed.newSessionId) {
+              newSessionId = parsed.newSessionId;
+            }
+            hadStreamingOutput = true;
+            outputChain = outputChain.then(() => onOutput(parsed));
+          } catch (err) {
+            logger.warn(
+              { group: group.name, error: err },
+              'Failed to parse streamed output chunk',
+            );
+          }
+        }
+      }
+    });
+
+    proc.stderr.on('data', (data) => {
+      const chunk = data.toString();
+      stderr += chunk;
+      for (const line of chunk.trim().split('\n')) {
+        if (line) logger.debug({ agent: group.folder }, line);
+      }
+    });
+
+    const configTimeout = group.containerConfig?.timeout || CONTAINER_TIMEOUT;
+    const timeoutMs = Math.max(configTimeout, IDLE_TIMEOUT + 30_000);
+    const timeout = setTimeout(() => {
+      logger.error(
+        { group: group.name },
+        'Direct agent timeout, killing process',
+      );
+      proc.kill('SIGKILL');
+    }, timeoutMs);
+
+    proc.on('close', (code) => {
+      clearTimeout(timeout);
+      const duration = Date.now() - startTime;
+
+      const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+      const logFile = path.join(logsDir, `direct-agent-${timestamp}.log`);
+      fs.writeFileSync(
+        logFile,
+        [
+          `=== Direct Agent Log ===`,
+          `Group: ${group.name}`,
+          `Duration: ${duration}ms`,
+          `Exit Code: ${code}`,
+          ``,
+          `=== Stderr ===`,
+          stderr,
+          ``,
+          `=== Stdout ===`,
+          stdout,
+        ].join('\n'),
+      );
+
+      if (code !== 0 && !hadStreamingOutput) {
+        logger.error(
+          { group: group.name, code, duration, stderr: stderr.slice(-200) },
+          'Direct agent exited with error',
+        );
+        resolve({
+          status: 'error',
+          result: null,
+          error: `Direct agent exited with code ${code}: ${stderr.slice(-200)}`,
+        });
+        return;
+      }
+
+      if (onOutput) {
+        outputChain.then(() => {
+          logger.info(
+            { group: group.name, duration, newSessionId },
+            'Direct agent completed (streaming mode)',
+          );
+          resolve({ status: 'success', result: null, newSessionId });
+        });
+        return;
+      }
+
+      // Legacy non-streaming parse
+      try {
+        const startIdx = stdout.indexOf(OUTPUT_START_MARKER);
+        const endIdx = stdout.indexOf(OUTPUT_END_MARKER);
+        let jsonLine: string;
+        if (startIdx !== -1 && endIdx !== -1 && endIdx > startIdx) {
+          jsonLine = stdout
+            .slice(startIdx + OUTPUT_START_MARKER.length, endIdx)
+            .trim();
+        } else {
+          const lines = stdout.trim().split('\n');
+          jsonLine = lines[lines.length - 1];
+        }
+        const output: ContainerOutput = JSON.parse(jsonLine);
+        logger.info(
+          { group: group.name, duration, status: output.status },
+          'Direct agent completed',
+        );
+        resolve(output);
+      } catch (err) {
+        logger.error(
+          { group: group.name, stdout, stderr, error: err },
+          'Failed to parse direct agent output',
+        );
+        resolve({
+          status: 'error',
+          result: null,
+          error: `Failed to parse output: ${err instanceof Error ? err.message : String(err)}`,
+        });
+      }
+    });
+
+    proc.on('error', (err) => {
+      clearTimeout(timeout);
+      logger.error({ group: group.name, error: err }, 'Direct agent spawn error');
+      resolve({
+        status: 'error',
+        result: null,
+        error: `Spawn error: ${err.message}`,
+      });
+    });
+  });
+}
+
 export async function runContainerAgent(
   group: RegisteredGroup,
   input: ContainerInput,
   onProcess: (proc: ChildProcess, containerName: string) => void,
   onOutput?: (output: ContainerOutput) => Promise<void>,
 ): Promise<ContainerOutput> {
+  if (DIRECT_MODE) {
+    return runDirectAgent(group, input, onProcess, onOutput);
+  }
   const startTime = Date.now();
 
   const groupDir = resolveGroupFolderPath(group.folder);

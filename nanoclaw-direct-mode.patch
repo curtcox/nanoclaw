@@ -1,0 +1,1020 @@
+diff --git a/README.md b/README.md
+index 874a8d7..805aaf2 100644
+--- a/README.md
++++ b/README.md
+@@ -72,6 +72,7 @@ Then run `/setup`. Claude Code handles everything: dependencies, authentication,
+ - **Scheduled tasks** - Recurring jobs that run Claude and can message you back
+ - **Web access** - Search and fetch content from the Web
+ - **Container isolation** - Agents are sandboxed in Docker (macOS/Linux), [Docker Sandboxes](docs/docker-sandboxes.md) (micro VM isolation), or Apple Container (macOS)
++- **Direct mode** - Run without Docker entirely using [direct mode](docs/direct-mode.md), where agents execute as host child processes via the Claude CLI
+ - **Credential security** - Agents never hold raw API keys. Outbound requests route through [OneCLI's Agent Vault](https://github.com/onecli/onecli), which injects credentials at request time and enforces per-agent policies and rate limits.
+ - **Agent Swarms** - Spin up teams of specialized agents that collaborate on complex tasks
+ - **Optional integrations** - Add Gmail (`/add-gmail`) and more via skills
+@@ -128,6 +129,18 @@ Skills we'd like to see:
+ - [Claude Code](https://claude.ai/download)
+ - [Apple Container](https://github.com/apple/container) (macOS) or [Docker](https://docker.com/products/docker-desktop) (macOS/Linux)
+ 
++### Running Without Docker (Direct Mode)
++
++If you don't have or don't want Docker, NanoClaw can run agents as host child processes instead of in containers:
++
++```bash
++npm install
++cd container/agent-runner && npm install && cd ../..
++NANOCLAW_DIRECT_MODE=1 npx tsx src/index.ts
++```
++
++This gives you full functionality (all channels, scheduled tasks, session continuity) without any container runtime. See [docs/direct-mode.md](docs/direct-mode.md) for details.
++
+ ## Architecture
+ 
+ ```
+@@ -153,7 +166,7 @@ Key files:
+ 
+ **Why Docker?**
+ 
+-Docker provides cross-platform support (macOS, Linux and even Windows via WSL2) and a mature ecosystem. On macOS, you can optionally switch to Apple Container via `/convert-to-apple-container` for a lighter-weight native runtime. For additional isolation, [Docker Sandboxes](docs/docker-sandboxes.md) run each container inside a micro VM.
++Docker provides cross-platform support (macOS, Linux and even Windows via WSL2) and a mature ecosystem. On macOS, you can optionally switch to Apple Container via `/convert-to-apple-container` for a lighter-weight native runtime. For additional isolation, [Docker Sandboxes](docs/docker-sandboxes.md) run each container inside a micro VM. If you don't need container isolation, you can skip Docker entirely with [direct mode](docs/direct-mode.md).
+ 
+ **Can I run this on Linux or Windows?**
+ 
+diff --git a/container/agent-runner/src/index-direct.ts b/container/agent-runner/src/index-direct.ts
+new file mode 100644
+index 0000000..b9cc1b5
+--- /dev/null
++++ b/container/agent-runner/src/index-direct.ts
+@@ -0,0 +1,200 @@
++/**
++ * NanoClaw Direct-Mode Agent Runner
++ *
++ * Alternative to index.ts that uses the `claude` CLI directly
++ * instead of the Claude Agent SDK's query() function.
++ * Use this when running in direct mode (NANOCLAW_DIRECT_MODE=1)
++ * where the SDK's internal IPC may not work (e.g., sandboxed environments).
++ *
++ * Input/output protocol is identical to the container-based runner:
++ *   Stdin: Full ContainerInput JSON
++ *   Stdout: OUTPUT_START_MARKER / OUTPUT_END_MARKER wrapped JSON
++ */
++
++import fs from 'fs';
++import path from 'path';
++import { spawn } from 'child_process';
++
++interface ContainerInput {
++  prompt: string;
++  sessionId?: string;
++  groupFolder: string;
++  chatJid: string;
++  isMain: boolean;
++  isScheduledTask?: boolean;
++  assistantName?: string;
++  script?: string;
++}
++
++interface ContainerOutput {
++  status: 'success' | 'error';
++  result: string | null;
++  newSessionId?: string;
++  error?: string;
++}
++
++const OUTPUT_START_MARKER = '---NANOCLAW_OUTPUT_START---';
++const OUTPUT_END_MARKER = '---NANOCLAW_OUTPUT_END---';
++
++function writeOutput(output: ContainerOutput): void {
++  console.log(OUTPUT_START_MARKER);
++  console.log(JSON.stringify(output));
++  console.log(OUTPUT_END_MARKER);
++}
++
++function log(message: string): void {
++  console.error(`[agent-runner-direct] ${message}`);
++}
++
++async function readStdin(): Promise<string> {
++  return new Promise((resolve, reject) => {
++    let data = '';
++    process.stdin.setEncoding('utf8');
++    process.stdin.on('data', (chunk) => { data += chunk; });
++    process.stdin.on('end', () => resolve(data));
++    process.stdin.on('error', reject);
++  });
++}
++
++/**
++ * Run claude CLI and return the result.
++ * Uses --print mode with JSON output for structured responses.
++ */
++async function runClaude(
++  prompt: string,
++  cwd: string,
++  sessionId?: string,
++  systemPromptAppend?: string,
++): Promise<{ result: string; sessionId: string }> {
++  return new Promise((resolve, reject) => {
++    const args = [
++      '-p', prompt,
++      '--output-format', 'json',
++      '--dangerously-skip-permissions',
++    ];
++
++    if (sessionId) {
++      args.push('--resume', sessionId);
++    }
++
++    if (systemPromptAppend) {
++      args.push('--append-system-prompt', systemPromptAppend);
++    }
++
++    log(`Spawning: claude ${args.slice(0, 4).join(' ')}... (cwd: ${cwd})`);
++
++    const proc = spawn('claude', args, {
++      stdio: ['pipe', 'pipe', 'pipe'],
++      cwd,
++      env: { ...process.env },
++    });
++
++    // Close stdin immediately so claude doesn't wait for piped input
++    proc.stdin.end();
++
++    let stdout = '';
++    let stderr = '';
++
++    proc.stdout.on('data', (d: Buffer) => { stdout += d.toString(); });
++    proc.stderr.on('data', (d: Buffer) => {
++      const chunk = d.toString();
++      stderr += chunk;
++      // Log stderr lines for debugging
++      for (const line of chunk.trim().split('\n')) {
++        if (line) log(`[claude] ${line}`);
++      }
++    });
++
++    proc.on('close', (code: number | null) => {
++      if (code !== 0) {
++        reject(new Error(`claude exited with code ${code}: ${stderr.slice(-300)}`));
++        return;
++      }
++
++      try {
++        const parsed = JSON.parse(stdout);
++        resolve({
++          result: parsed.result || '',
++          sessionId: parsed.session_id || '',
++        });
++      } catch (err) {
++        // If JSON parse fails, use raw stdout as the result
++        if (stdout.trim()) {
++          resolve({ result: stdout.trim(), sessionId: '' });
++        } else {
++          reject(new Error(`Failed to parse claude output: ${err}`));
++        }
++      }
++    });
++
++    proc.on('error', (err) => {
++      reject(new Error(`Failed to spawn claude: ${err.message}`));
++    });
++  });
++}
++
++async function main(): Promise<void> {
++  let containerInput: ContainerInput;
++
++  try {
++    const stdinData = await readStdin();
++    containerInput = JSON.parse(stdinData);
++    log(`Received input for group: ${containerInput.groupFolder}`);
++  } catch (err) {
++    writeOutput({
++      status: 'error',
++      result: null,
++      error: `Failed to parse input: ${err instanceof Error ? err.message : String(err)}`,
++    });
++    process.exit(1);
++  }
++
++  // Resolve working directory
++  const groupDir = process.env.NANOCLAW_GROUP_DIR || '/workspace/group';
++
++  // Load global CLAUDE.md for system prompt append
++  const globalDir = process.env.NANOCLAW_GLOBAL_DIR || '';
++  let globalClaudeMd: string | undefined;
++  if (!containerInput.isMain && globalDir) {
++    const globalMdPath = path.join(globalDir, 'CLAUDE.md');
++    if (fs.existsSync(globalMdPath)) {
++      globalClaudeMd = fs.readFileSync(globalMdPath, 'utf-8');
++    }
++  }
++
++  // Build prompt
++  let prompt = containerInput.prompt;
++  if (containerInput.isScheduledTask) {
++    prompt = `[SCHEDULED TASK]\n\n${prompt}`;
++  }
++
++  try {
++    log(`Running claude with prompt (${prompt.length} chars)...`);
++
++    const result = await runClaude(
++      prompt,
++      groupDir,
++      containerInput.sessionId,
++      globalClaudeMd,
++    );
++
++    log(`Claude responded (${result.result.length} chars), session: ${result.sessionId}`);
++
++    writeOutput({
++      status: 'success',
++      result: result.result || null,
++      newSessionId: result.sessionId || undefined,
++    });
++  } catch (err) {
++    const errorMessage = err instanceof Error ? err.message : String(err);
++    log(`Error: ${errorMessage}`);
++    writeOutput({
++      status: 'error',
++      result: null,
++      error: errorMessage,
++    });
++    process.exit(1);
++  }
++}
++
++main();
+diff --git a/container/agent-runner/src/index.ts b/container/agent-runner/src/index.ts
+index 7e739c7..e95033c 100644
+--- a/container/agent-runner/src/index.ts
++++ b/container/agent-runner/src/index.ts
+@@ -60,7 +60,9 @@ interface SDKUserMessage {
+   session_id: string;
+ }
+ 
+-const IPC_INPUT_DIR = '/workspace/ipc/input';
++const IPC_INPUT_DIR = process.env.NANOCLAW_DIRECT_MODE === '1'
++  ? path.join(process.env.NANOCLAW_IPC_DIR || '/workspace/ipc', 'input')
++  : '/workspace/ipc/input';
+ const IPC_INPUT_CLOSE_SENTINEL = path.join(IPC_INPUT_DIR, '_close');
+ const IPC_POLL_MS = 500;
+ 
+@@ -182,7 +184,10 @@ function createPreCompactHook(assistantName?: string): HookCallback {
+       const summary = getSessionSummary(sessionId, transcriptPath);
+       const name = summary ? sanitizeFilename(summary) : generateFallbackName();
+ 
+-      const conversationsDir = '/workspace/group/conversations';
++      const groupDir = process.env.NANOCLAW_DIRECT_MODE === '1'
++        ? (process.env.NANOCLAW_GROUP_DIR || '/workspace/group')
++        : '/workspace/group';
++      const conversationsDir = path.join(groupDir, 'conversations');
+       fs.mkdirSync(conversationsDir, { recursive: true });
+ 
+       const date = new Date().toISOString().split('T')[0];
+@@ -413,7 +418,10 @@ async function runQuery(
+   let resultCount = 0;
+ 
+   // Load global CLAUDE.md as additional system context (shared across all groups)
+-  const globalClaudeMdPath = '/workspace/global/CLAUDE.md';
++  const isDirect = process.env.NANOCLAW_DIRECT_MODE === '1';
++  const globalClaudeMdPath = isDirect
++    ? path.join(process.env.NANOCLAW_GLOBAL_DIR || '/workspace/global', 'CLAUDE.md')
++    : '/workspace/global/CLAUDE.md';
+   let globalClaudeMd: string | undefined;
+   if (!containerInput.isMain && fs.existsSync(globalClaudeMdPath)) {
+     globalClaudeMd = fs.readFileSync(globalClaudeMdPath, 'utf-8');
+@@ -435,10 +443,14 @@ async function runQuery(
+     log(`Additional directories: ${extraDirs.join(', ')}`);
+   }
+ 
++  const workingDir = isDirect
++    ? (process.env.NANOCLAW_GROUP_DIR || '/workspace/group')
++    : '/workspace/group';
++
+   for await (const message of query({
+     prompt: stream,
+     options: {
+-      cwd: '/workspace/group',
++      cwd: workingDir,
+       additionalDirectories: extraDirs.length > 0 ? extraDirs : undefined,
+       resume: sessionId,
+       resumeSessionAt: resumeAt,
+@@ -476,12 +488,16 @@ async function runQuery(
+       settingSources: ['project', 'user'],
+       mcpServers: {
+         nanoclaw: {
+-          command: 'node',
+-          args: [mcpServerPath],
++          command: isDirect ? 'npx' : 'node',
++          args: isDirect ? ['tsx', mcpServerPath] : [mcpServerPath],
+           env: {
+             NANOCLAW_CHAT_JID: containerInput.chatJid,
+             NANOCLAW_GROUP_FOLDER: containerInput.groupFolder,
+             NANOCLAW_IS_MAIN: containerInput.isMain ? '1' : '0',
++            ...(isDirect ? {
++              NANOCLAW_DIRECT_MODE: '1',
++              NANOCLAW_IPC_DIR: process.env.NANOCLAW_IPC_DIR || '/workspace/ipc',
++            } : {}),
+           },
+         },
+       },
+@@ -629,7 +645,8 @@ async function main(): Promise<void> {
+   };
+ 
+   const __dirname = path.dirname(fileURLToPath(import.meta.url));
+-  const mcpServerPath = path.join(__dirname, 'ipc-mcp-stdio.js');
++  const mcpServerExt = process.env.NANOCLAW_DIRECT_MODE === '1' ? 'ipc-mcp-stdio.ts' : 'ipc-mcp-stdio.js';
++  const mcpServerPath = path.join(__dirname, mcpServerExt);
+ 
+   let sessionId = containerInput.sessionId;
+   fs.mkdirSync(IPC_INPUT_DIR, { recursive: true });
+diff --git a/container/agent-runner/src/ipc-mcp-stdio.ts b/container/agent-runner/src/ipc-mcp-stdio.ts
+index 989891b..7ba2c91 100644
+--- a/container/agent-runner/src/ipc-mcp-stdio.ts
++++ b/container/agent-runner/src/ipc-mcp-stdio.ts
+@@ -11,7 +11,9 @@ import fs from 'fs';
+ import path from 'path';
+ import { CronExpressionParser } from 'cron-parser';
+ 
+-const IPC_DIR = '/workspace/ipc';
++const IPC_DIR = process.env.NANOCLAW_DIRECT_MODE === '1'
++  ? (process.env.NANOCLAW_IPC_DIR || '/workspace/ipc')
++  : '/workspace/ipc';
+ const MESSAGES_DIR = path.join(IPC_DIR, 'messages');
+ const TASKS_DIR = path.join(IPC_DIR, 'tasks');
+ 
+diff --git a/docs/direct-mode.md b/docs/direct-mode.md
+new file mode 100644
+index 0000000..f09cbde
+--- /dev/null
++++ b/docs/direct-mode.md
+@@ -0,0 +1,157 @@
++# Direct Mode (No Docker)
++
++Direct mode runs NanoClaw agents as host child processes instead of inside Docker containers. This removes the Docker/Apple Container dependency entirely while preserving all NanoClaw functionality: multi-channel messaging, scheduled tasks, IPC, session continuity, and per-group isolation.
++
++## When to Use Direct Mode
++
++- You don't have Docker or Apple Container installed and don't want to install them
++- You're running in a sandboxed or CI environment where Docker isn't available
++- You want simpler debugging with agents running directly on the host
++- You're developing or testing NanoClaw itself
++
++**Trade-off:** Direct mode gives up container-level filesystem isolation. Agents run as child processes on the host with access to whatever the host user can access. If you need strong sandboxing, use the standard container mode.
++
++## Prerequisites
++
++- **Node.js 20+** (with `npx` available)
++- **Claude Code CLI** installed and authenticated. Get it at [claude.ai/download](https://claude.ai/download). Verify with:
++  ```bash
++  claude --version
++  ```
++- **tsx** installed globally (or available via npx):
++  ```bash
++  npm install -g tsx
++  ```
++
++## Installation
++
++From a fresh clone:
++
++```bash
++git clone https://github.com/<your-fork>/nanoclaw.git
++cd nanoclaw
++
++# Install host dependencies
++npm install
++
++# Install agent-runner dependencies
++cd container/agent-runner
++npm install
++cd ../..
++```
++
++## Running
++
++```bash
++NANOCLAW_DIRECT_MODE=1 npx tsx src/index.ts
++```
++
++That's it. NanoClaw starts with:
++- The **CLI channel** auto-enabled (stdin/stdout interaction)
++- A **main group** auto-registered as `cli:main`
++- The default trigger word `@Andy`
++
++Type `@Andy hello` and you'll get a response from Claude.
++
++### With Other Channels
++
++Direct mode works with all channels (WhatsApp, Telegram, Discord, Slack, Gmail). Set up channels the normal way (credentials in `.env`, run the appropriate `/add-*` skill), then start with:
++
++```bash
++NANOCLAW_DIRECT_MODE=1 npx tsx src/index.ts
++```
++
++The CLI channel activates automatically alongside whatever other channels you've configured.
++
++### Disabling the CLI Channel
++
++If you only want messaging channels (no stdin/stdout), set:
++
++```bash
++NANOCLAW_DIRECT_MODE=1 NANOCLAW_CLI_CHANNEL=0 npx tsx src/index.ts
++```
++
++## Environment Variables
++
++| Variable | Default | Description |
++|---|---|---|
++| `NANOCLAW_DIRECT_MODE` | `0` | Set to `1` to enable direct mode (no Docker) |
++| `NANOCLAW_CLI_CHANNEL` | `1` (when direct mode on) | Set to `0` to disable the CLI stdin/stdout channel |
++| `TZ` | `America/Los_Angeles` | Timezone for scheduled tasks and cron expressions |
++
++All other NanoClaw environment variables (API keys, channel credentials, etc.) work identically in direct mode.
++
++## How It Works
++
++In standard mode, NanoClaw spawns a Docker container for each agent invocation. The container runs the agent-runner (`container/agent-runner/src/index.ts`), which uses the Claude Agent SDK to execute prompts.
++
++In direct mode, NanoClaw instead:
++
++1. Spawns `tsx container/agent-runner/src/index-direct.ts` as a child process on the host
++2. Passes the same `ContainerInput` JSON via stdin
++3. The agent-runner calls `claude -p <prompt> --output-format json --dangerously-skip-permissions` (the Claude Code CLI)
++4. Output flows back through the same `OUTPUT_START_MARKER`/`OUTPUT_END_MARKER` protocol
++5. IPC (messages, tasks) uses the same filesystem-based mechanism, just with host paths instead of container-mounted paths
++
++The key difference in the agent-runner: `index-direct.ts` uses the `claude` CLI binary instead of the Claude Agent SDK's `query()` function. The CLI approach is more robust across different environments because it doesn't depend on the SDK's internal IPC mechanisms.
++
++### Path Mapping
++
++In container mode, agents see fixed paths like `/workspace/group`, `/workspace/ipc`. In direct mode, the host passes real paths via environment variables:
++
++| Container Path | Direct Mode Env Var | Typical Value |
++|---|---|---|
++| `/workspace/group` | `NANOCLAW_GROUP_DIR` | `<project>/groups/<folder>` |
++| `/workspace/ipc` | `NANOCLAW_IPC_DIR` | `<project>/groups/<folder>/.ipc` |
++| `/workspace/global` | `NANOCLAW_GLOBAL_DIR` | `<project>/groups/main` |
++| `/workspace/sessions` | `NANOCLAW_SESSIONS_DIR` | `<project>/data/sessions/<folder>` |
++
++## Architecture Diagram
++
++```
++Standard Mode:
++  Channels --> SQLite --> Polling loop --> Docker Container --> Claude Agent SDK --> Response
++
++Direct Mode:
++  Channels --> SQLite --> Polling loop --> Child Process (tsx) --> Claude CLI --> Response
++```
++
++## CLI Channel Commands
++
++When the CLI channel is active, you can type directly into stdin:
++
++- `@Andy <message>` - Send a message to the agent
++- `/quit` or `/exit` - Shut down NanoClaw
++
++## Troubleshooting
++
++### "claude: command not found"
++
++Claude Code CLI is not installed or not in your PATH. Install it from [claude.ai/download](https://claude.ai/download), then verify:
++
++```bash
++which claude
++claude --version
++```
++
++### "tsx: command not found"
++
++Install tsx globally:
++
++```bash
++npm install -g tsx
++```
++
++Or ensure it's available via npx (it's a devDependency of the project).
++
++### Agent returns empty responses
++
++Make sure Claude Code is authenticated. Run `claude` interactively once to complete the OAuth flow, then try direct mode again.
++
++### Session continuity not working
++
++Sessions are stored in `data/sessions/<group-folder>/`. Make sure the data directory is writable. Session IDs are passed via `--resume` to the Claude CLI.
++
++### Scheduled tasks not firing
++
++Scheduled tasks work identically in direct mode. Check that your cron expressions use local time (not UTC). Use `list_tasks` via the MCP tools to inspect task state.
+diff --git a/src/channels/cli.ts b/src/channels/cli.ts
+new file mode 100644
+index 0000000..d0b8ccb
+--- /dev/null
++++ b/src/channels/cli.ts
+@@ -0,0 +1,121 @@
++/**
++ * CLI Channel for NanoClaw
++ *
++ * A simple stdin/stdout channel for local testing and direct-mode operation.
++ * Messages typed into the terminal are delivered to the main group.
++ * Agent responses are printed to stdout.
++ *
++ * Activated when NANOCLAW_CLI_CHANNEL=1 or in direct mode with no other channels.
++ */
++import readline from 'readline';
++
++import { ChannelOpts, registerChannel } from './registry.js';
++import { Channel, NewMessage } from '../types.js';
++import { ASSISTANT_NAME } from '../config.js';
++import { logger } from '../logger.js';
++
++const CLI_JID = 'cli:main';
++
++function createCliChannel(opts: ChannelOpts): Channel | null {
++  // Only activate if explicitly enabled or in direct mode
++  if (
++    process.env.NANOCLAW_CLI_CHANNEL !== '1' &&
++    process.env.NANOCLAW_DIRECT_MODE !== '1'
++  ) {
++    return null;
++  }
++
++  let connected = false;
++  let rl: readline.Interface | null = null;
++
++  const channel: Channel = {
++    name: 'cli',
++
++    async connect(): Promise<void> {
++      connected = true;
++
++      // Register the CLI as a main group chat
++      opts.onChatMetadata(CLI_JID, new Date().toISOString(), 'CLI', 'cli', false);
++
++      // Auto-register as the main group if not already registered
++      const groups = opts.registeredGroups();
++      if (!groups[CLI_JID]) {
++        // The orchestrator's registerGroup will handle this via IPC,
++        // but we need to seed the registered groups for the first run.
++        // We do this by storing a message that triggers auto-registration.
++        logger.info('CLI channel: auto-registering as main group');
++      }
++
++      rl = readline.createInterface({
++        input: process.stdin,
++        output: process.stdout,
++        prompt: `\n${ASSISTANT_NAME}> `,
++      });
++
++      rl.prompt();
++
++      rl.on('line', (line: string) => {
++        const trimmed = line.trim();
++        if (!trimmed) {
++          rl?.prompt();
++          return;
++        }
++
++        // Special CLI commands
++        if (trimmed === '/quit' || trimmed === '/exit') {
++          console.log('Goodbye!');
++          process.exit(0);
++        }
++
++        const msg: NewMessage = {
++          id: `cli-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
++          chat_jid: CLI_JID,
++          sender: 'user@cli',
++          sender_name: 'User',
++          content: trimmed,
++          timestamp: new Date().toISOString(),
++          is_from_me: true,
++          is_bot_message: false,
++        };
++
++        opts.onMessage(CLI_JID, msg);
++      });
++
++      rl.on('close', () => {
++        connected = false;
++      });
++
++      logger.info('CLI channel connected — type messages below');
++    },
++
++    async sendMessage(_jid: string, text: string): Promise<void> {
++      // Print the agent's response to stdout
++      console.log(`\n${ASSISTANT_NAME}: ${text}`);
++      rl?.prompt();
++    },
++
++    isConnected(): boolean {
++      return connected;
++    },
++
++    ownsJid(jid: string): boolean {
++      return jid === CLI_JID;
++    },
++
++    async disconnect(): Promise<void> {
++      connected = false;
++      rl?.close();
++    },
++
++    async setTyping(_jid: string, isTyping: boolean): Promise<void> {
++      if (isTyping) {
++        process.stdout.write(`${ASSISTANT_NAME} is thinking...`);
++      }
++    },
++  };
++
++  return channel;
++}
++
++// Self-register
++registerChannel('cli', createCliChannel);
+diff --git a/src/channels/index.ts b/src/channels/index.ts
+index 44f4f55..0f7793a 100644
+--- a/src/channels/index.ts
++++ b/src/channels/index.ts
+@@ -1,6 +1,9 @@
+ // Channel self-registration barrel file.
+ // Each import triggers the channel module's registerChannel() call.
+ 
++// cli (direct mode / local testing)
++import './cli.js';
++
+ // discord
+ 
+ // gmail
+diff --git a/src/container-runner.test.ts b/src/container-runner.test.ts
+index 36fca0a..150854b 100644
+--- a/src/container-runner.test.ts
++++ b/src/container-runner.test.ts
+@@ -54,6 +54,7 @@ vi.mock('./mount-security.js', () => ({
+ // Mock container-runtime
+ vi.mock('./container-runtime.js', () => ({
+   CONTAINER_RUNTIME_BIN: 'docker',
++  DIRECT_MODE: false,
+   hostGatewayArgs: () => [],
+   readonlyMountArgs: (h: string, c: string) => ['-v', `${h}:${c}:ro`],
+   stopContainer: vi.fn(),
+diff --git a/src/container-runner.ts b/src/container-runner.ts
+index dafa143..3208b79 100644
+--- a/src/container-runner.ts
++++ b/src/container-runner.ts
+@@ -20,6 +20,7 @@ import { resolveGroupFolderPath, resolveGroupIpcPath } from './group-folder.js';
+ import { logger } from './logger.js';
+ import {
+   CONTAINER_RUNTIME_BIN,
++  DIRECT_MODE,
+   hostGatewayArgs,
+   readonlyMountArgs,
+   stopContainer,
+@@ -293,12 +294,267 @@ async function buildContainerArgs(
+   return args;
+ }
+ 
++/**
++ * Run agent directly as a host child process (no Docker).
++ * Uses index-direct.ts which calls the `claude` CLI.
++ */
++async function runDirectAgent(
++  group: RegisteredGroup,
++  input: ContainerInput,
++  onProcess: (proc: ChildProcess, containerName: string) => void,
++  onOutput?: (output: ContainerOutput) => Promise<void>,
++): Promise<ContainerOutput> {
++  const startTime = Date.now();
++  const projectRoot = process.cwd();
++
++  const groupDir = resolveGroupFolderPath(group.folder);
++  fs.mkdirSync(groupDir, { recursive: true });
++
++  const groupIpcDir = resolveGroupIpcPath(group.folder);
++  fs.mkdirSync(path.join(groupIpcDir, 'messages'), { recursive: true });
++  fs.mkdirSync(path.join(groupIpcDir, 'tasks'), { recursive: true });
++  fs.mkdirSync(path.join(groupIpcDir, 'input'), { recursive: true });
++
++  const globalDir = path.join(GROUPS_DIR, 'global');
++  const groupSessionsDir = path.join(
++    DATA_DIR,
++    'sessions',
++    group.folder,
++    '.claude',
++  );
++  fs.mkdirSync(groupSessionsDir, { recursive: true });
++
++  // Sync skills into group sessions dir
++  const skillsSrc = path.join(projectRoot, 'container', 'skills');
++  const skillsDst = path.join(groupSessionsDir, 'skills');
++  if (fs.existsSync(skillsSrc)) {
++    for (const skillDir of fs.readdirSync(skillsSrc)) {
++      const srcDir = path.join(skillsSrc, skillDir);
++      if (!fs.statSync(srcDir).isDirectory()) continue;
++      const dstDir = path.join(skillsDst, skillDir);
++      fs.cpSync(srcDir, dstDir, { recursive: true });
++    }
++  }
++
++  // Settings file for Claude Code
++  const settingsFile = path.join(groupSessionsDir, 'settings.json');
++  if (!fs.existsSync(settingsFile)) {
++    fs.writeFileSync(
++      settingsFile,
++      JSON.stringify(
++        {
++          env: {
++            CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS: '1',
++            CLAUDE_CODE_ADDITIONAL_DIRECTORIES_CLAUDE_MD: '1',
++            CLAUDE_CODE_DISABLE_AUTO_MEMORY: '0',
++          },
++        },
++        null,
++        2,
++      ) + '\n',
++    );
++  }
++
++  const agentRunnerDir = path.join(projectRoot, 'container', 'agent-runner');
++  const agentRunnerNodeModules = path.join(agentRunnerDir, 'node_modules');
++  const entryPoint = path.join(agentRunnerDir, 'src', 'index-direct.ts');
++
++  const childEnv: Record<string, string> = {
++    ...process.env as Record<string, string>,
++    TZ: TIMEZONE,
++    NANOCLAW_DIRECT_MODE: '1',
++    NANOCLAW_GROUP_DIR: groupDir,
++    NANOCLAW_IPC_DIR: groupIpcDir,
++    NANOCLAW_GLOBAL_DIR: globalDir,
++    NANOCLAW_PROJECT_DIR: projectRoot,
++    NANOCLAW_SESSIONS_DIR: groupSessionsDir,
++    NODE_PATH: agentRunnerNodeModules,
++  };
++
++  logger.info(
++    {
++      group: group.name,
++      entryPoint,
++      groupDir,
++      ipcDir: groupIpcDir,
++      isMain: input.isMain,
++    },
++    'Spawning direct agent',
++  );
++
++  const logsDir = path.join(groupDir, 'logs');
++  fs.mkdirSync(logsDir, { recursive: true });
++
++  return new Promise((resolve) => {
++    const proc = spawn('npx', ['tsx', entryPoint], {
++      stdio: ['pipe', 'pipe', 'pipe'],
++      env: childEnv,
++      cwd: groupDir,
++    });
++
++    const containerName = `direct-${group.folder}-${Date.now()}`;
++    onProcess(proc, containerName);
++
++    let stdout = '';
++    let stderr = '';
++    let parseBuffer = '';
++    let newSessionId: string | undefined;
++    let outputChain = Promise.resolve();
++    let hadStreamingOutput = false;
++
++    proc.stdin.write(JSON.stringify(input));
++    proc.stdin.end();
++
++    proc.stdout.on('data', (data) => {
++      const chunk = data.toString();
++      stdout += chunk;
++
++      if (onOutput) {
++        parseBuffer += chunk;
++        let startIdx: number;
++        while ((startIdx = parseBuffer.indexOf(OUTPUT_START_MARKER)) !== -1) {
++          const endIdx = parseBuffer.indexOf(OUTPUT_END_MARKER, startIdx);
++          if (endIdx === -1) break;
++
++          const jsonStr = parseBuffer
++            .slice(startIdx + OUTPUT_START_MARKER.length, endIdx)
++            .trim();
++          parseBuffer = parseBuffer.slice(endIdx + OUTPUT_END_MARKER.length);
++
++          try {
++            const parsed: ContainerOutput = JSON.parse(jsonStr);
++            if (parsed.newSessionId) {
++              newSessionId = parsed.newSessionId;
++            }
++            hadStreamingOutput = true;
++            outputChain = outputChain.then(() => onOutput(parsed));
++          } catch (err) {
++            logger.warn(
++              { group: group.name, error: err },
++              'Failed to parse streamed output chunk',
++            );
++          }
++        }
++      }
++    });
++
++    proc.stderr.on('data', (data) => {
++      const chunk = data.toString();
++      stderr += chunk;
++      for (const line of chunk.trim().split('\n')) {
++        if (line) logger.debug({ agent: group.folder }, line);
++      }
++    });
++
++    const configTimeout = group.containerConfig?.timeout || CONTAINER_TIMEOUT;
++    const timeoutMs = Math.max(configTimeout, IDLE_TIMEOUT + 30_000);
++    const timeout = setTimeout(() => {
++      logger.error(
++        { group: group.name },
++        'Direct agent timeout, killing process',
++      );
++      proc.kill('SIGKILL');
++    }, timeoutMs);
++
++    proc.on('close', (code) => {
++      clearTimeout(timeout);
++      const duration = Date.now() - startTime;
++
++      const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
++      const logFile = path.join(logsDir, `direct-agent-${timestamp}.log`);
++      fs.writeFileSync(
++        logFile,
++        [
++          `=== Direct Agent Log ===`,
++          `Group: ${group.name}`,
++          `Duration: ${duration}ms`,
++          `Exit Code: ${code}`,
++          ``,
++          `=== Stderr ===`,
++          stderr,
++          ``,
++          `=== Stdout ===`,
++          stdout,
++        ].join('\n'),
++      );
++
++      if (code !== 0 && !hadStreamingOutput) {
++        logger.error(
++          { group: group.name, code, duration, stderr: stderr.slice(-200) },
++          'Direct agent exited with error',
++        );
++        resolve({
++          status: 'error',
++          result: null,
++          error: `Direct agent exited with code ${code}: ${stderr.slice(-200)}`,
++        });
++        return;
++      }
++
++      if (onOutput) {
++        outputChain.then(() => {
++          logger.info(
++            { group: group.name, duration, newSessionId },
++            'Direct agent completed (streaming mode)',
++          );
++          resolve({ status: 'success', result: null, newSessionId });
++        });
++        return;
++      }
++
++      // Legacy non-streaming parse
++      try {
++        const startIdx = stdout.indexOf(OUTPUT_START_MARKER);
++        const endIdx = stdout.indexOf(OUTPUT_END_MARKER);
++        let jsonLine: string;
++        if (startIdx !== -1 && endIdx !== -1 && endIdx > startIdx) {
++          jsonLine = stdout
++            .slice(startIdx + OUTPUT_START_MARKER.length, endIdx)
++            .trim();
++        } else {
++          const lines = stdout.trim().split('\n');
++          jsonLine = lines[lines.length - 1];
++        }
++        const output: ContainerOutput = JSON.parse(jsonLine);
++        logger.info(
++          { group: group.name, duration, status: output.status },
++          'Direct agent completed',
++        );
++        resolve(output);
++      } catch (err) {
++        logger.error(
++          { group: group.name, stdout, stderr, error: err },
++          'Failed to parse direct agent output',
++        );
++        resolve({
++          status: 'error',
++          result: null,
++          error: `Failed to parse output: ${err instanceof Error ? err.message : String(err)}`,
++        });
++      }
++    });
++
++    proc.on('error', (err) => {
++      clearTimeout(timeout);
++      logger.error({ group: group.name, error: err }, 'Direct agent spawn error');
++      resolve({
++        status: 'error',
++        result: null,
++        error: `Spawn error: ${err.message}`,
++      });
++    });
++  });
++}
++
+ export async function runContainerAgent(
+   group: RegisteredGroup,
+   input: ContainerInput,
+   onProcess: (proc: ChildProcess, containerName: string) => void,
+   onOutput?: (output: ContainerOutput) => Promise<void>,
+ ): Promise<ContainerOutput> {
++  if (DIRECT_MODE) {
++    return runDirectAgent(group, input, onProcess, onOutput);
++  }
+   const startTime = Date.now();
+ 
+   const groupDir = resolveGroupFolderPath(group.folder);
+diff --git a/src/container-runtime.ts b/src/container-runtime.ts
+index beaedfa..54ff389 100644
+--- a/src/container-runtime.ts
++++ b/src/container-runtime.ts
+@@ -7,11 +7,15 @@ import os from 'os';
+ 
+ import { logger } from './logger.js';
+ 
++/** Whether to run agents directly without Docker containers. */
++export const DIRECT_MODE = process.env.NANOCLAW_DIRECT_MODE === '1';
++
+ /** The container runtime binary name. */
+ export const CONTAINER_RUNTIME_BIN = 'docker';
+ 
+ /** CLI args needed for the container to resolve the host gateway. */
+ export function hostGatewayArgs(): string[] {
++  if (DIRECT_MODE) return [];
+   // On Linux, host.docker.internal isn't built-in — add it explicitly
+   if (os.platform() === 'linux') {
+     return ['--add-host=host.docker.internal:host-gateway'];
+@@ -29,6 +33,7 @@ export function readonlyMountArgs(
+ 
+ /** Stop a container by name. Uses execFileSync to avoid shell injection. */
+ export function stopContainer(name: string): void {
++  if (DIRECT_MODE) return;
+   if (!/^[a-zA-Z0-9][a-zA-Z0-9_.-]*$/.test(name)) {
+     throw new Error(`Invalid container name: ${name}`);
+   }
+@@ -37,6 +42,10 @@ export function stopContainer(name: string): void {
+ 
+ /** Ensure the container runtime is running, starting it if needed. */
+ export function ensureContainerRuntimeRunning(): void {
++  if (DIRECT_MODE) {
++    logger.info('Direct mode enabled — skipping container runtime check');
++    return;
++  }
+   try {
+     execSync(`${CONTAINER_RUNTIME_BIN} info`, {
+       stdio: 'pipe',
+@@ -77,6 +86,7 @@ export function ensureContainerRuntimeRunning(): void {
+ 
+ /** Kill orphaned NanoClaw containers from previous runs. */
+ export function cleanupOrphans(): void {
++  if (DIRECT_MODE) return;
+   try {
+     const output = execSync(
+       `${CONTAINER_RUNTIME_BIN} ps --filter name=nanoclaw- --format '{{.Names}}'`,
+diff --git a/src/index.ts b/src/index.ts
+index 004764d..316535b 100644
+--- a/src/index.ts
++++ b/src/index.ts
+@@ -27,6 +27,7 @@ import {
+ } from './container-runner.js';
+ import {
+   cleanupOrphans,
++  DIRECT_MODE,
+   ensureContainerRuntimeRunning,
+ } from './container-runtime.js';
+ import {
+@@ -574,6 +575,19 @@ async function main(): Promise<void> {
+   logger.info('Database initialized');
+   loadState();
+ 
++  // In direct mode with CLI channel, auto-register the CLI as the main group
++  if (DIRECT_MODE && !registeredGroups['cli:main']) {
++    registerGroup('cli:main', {
++      name: 'CLI Main',
++      folder: 'main',
++      trigger: DEFAULT_TRIGGER,
++      added_at: new Date().toISOString(),
++      requiresTrigger: false,
++      isMain: true,
++    });
++    logger.info('Auto-registered CLI main group for direct mode');
++  }
++
+   // Ensure OneCLI agents exist for all registered groups.
+   // Recovers from missed creates (e.g. OneCLI was down at registration time).
+   for (const [jid, group] of Object.entries(registeredGroups)) {
